@@ -157,10 +157,10 @@ python -m src.main
 powershell -ExecutionPolicy Bypass -File .\build-keiframe.ps1
 ```
 
-输出位于 `dist/Keiframe`，其中包含 `Keiframe.exe`、运行库、`resources` 和中文说明。
+主发布目录位于 `dist/Keiframe_Release_v1.07`，包含 `Keiframe.exe`、运行库和运行时资源。PP-OCRv5 模型与字典单独输出到 `dist/KeiFrame_PP-OCRv5_Addon`；PowerShell 入口调用与上游相同的 BAT 发布流程。
 
 打包版固定从 `Keiframe.exe` 所在目录读取 `settings.json`，即默认路径为
-`dist/Keiframe/settings.json`。新生成的发布目录不会复制开发者的个人配置；
+`dist/Keiframe_Release_v1.07/settings.json`。新生成的发布目录不会复制开发者的个人配置；
 文件不存在时程序使用内置默认值，用户在设置窗口保存后会在 EXE 同目录创建它。
 因此不要把发布目录放进普通用户没有写入权限的位置（例如 `Program Files`）。
 
@@ -221,7 +221,7 @@ Add-AppxPackage `
 3. 启动 Keiframe 主程序。打包版运行：
 
 ```powershell
-.\dist\Keiframe\Keiframe.exe
+.\dist\Keiframe_Release_v1.07\Keiframe.exe
 ```
 
 源码版运行：

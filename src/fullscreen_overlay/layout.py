@@ -34,11 +34,23 @@ def select_capture_geometry(
     """
     if owner_geometry is None:
         return game_viewport
-    if rectangles_intersect(owner_geometry, game_viewport):
+    if rectangle_contains(game_viewport, owner_geometry):
         return game_viewport
     if (
         owner_screen_geometry is not None
         and rectangles_intersect(owner_geometry, owner_screen_geometry)
     ):
-        return owner_screen_geometry
+        x, y, width, height = owner_screen_geometry
+        ox, oy, ow, oh = owner_geometry
+        left, top = min(x, ox), min(y, oy)
+        return (left, top, max(x + width, ox + ow) - left,
+                max(y + height, oy + oh) - top)
     return game_viewport
+
+
+
+def rectangle_contains(outer: Rect, inner: Rect) -> bool:
+    x, y, width, height = outer
+    ix, iy, iw, ih = inner
+    return (min(width, height, iw, ih) > 0 and x <= ix and y <= iy
+            and ix + iw <= x + width and iy + ih <= y + height)

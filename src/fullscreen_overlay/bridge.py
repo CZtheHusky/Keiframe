@@ -10,6 +10,7 @@ from PyQt5.QtGui import QColor, QImage, QPainter, QRegion
 from PyQt5.QtWidgets import QApplication, QWidget
 
 from src.fullscreen_overlay.layout import select_capture_geometry
+from src.fullscreen_overlay.control import live_session, process_commands
 from src.fullscreen_overlay.protocol import encode_frame
 from src.utils.logging_util import get_logger
 from src.utils.window_utils import get_sc2_window_geometry, is_sc2_fullscreen
@@ -19,7 +20,6 @@ logger = get_logger(__name__)
 
 GAMEBAR_PACKAGE_FAMILY = "Keiframe.GameBar_83kdtmzvrsrdt"
 MAILBOX_FILE_NAME = "overlay.frame"
-COMMAND_FILE_NAME = "overlay.command"
 CONTENT_MARGIN = 8
 
 
@@ -67,21 +67,11 @@ class _FrameMailbox:
     def stop(self):
         self._stopping.set()
 
-    def consume_command(self):
-        """Return and remove one command written by the Game Bar widget."""
-        if self._folder is None:
-            return None
+    def has_consumer(self):
+        return live_session(self._folder) is not None
 
-        target = self._folder / COMMAND_FILE_NAME
-        try:
-            command = target.read_text(encoding="utf-8").strip()
-            target.unlink(missing_ok=True)
-            return command or None
-        except FileNotFoundError:
-            return None
-        except Exception as exc:
-            logger.warning(f"无法读取 Game Bar 控制命令: {exc}")
-            return None
+    def process_commands(self, execute):
+        process_commands(self._folder, execute)
 
     def _run(self):
         if self._folder is None:
@@ -97,7 +87,8 @@ class _FrameMailbox:
                 continue
 
             try:
-                self._folder.mkdir(parents=True, exist_ok=True)
+                if not self.has_consumer():
+                    continue
                 with temporary.open("wb") as stream:
                     stream.write(payload)
                     stream.flush()
@@ -140,6 +131,9 @@ class FullscreenOverlayBridge:
 
     def _publish_if_changed(self):
         self._consume_widget_command()
+
+        if not self._mailbox.has_consumer():
+            return
 
         if not is_sc2_fullscreen():
             return
@@ -329,16 +323,11 @@ class FullscreenOverlayBridge:
         self._mailbox.publish(payload)
 
     def _consume_widget_command(self):
-        command = self._mailbox.consume_command()
-        if not command:
-            return
-
-        command_name = command.splitlines()[0].strip().casefold()
-        if command_name == "toggle_lock":
-            lock_signal = getattr(self.owner, "lock_signal", None)
-            if lock_signal is not None:
-                lock_signal.emit()
-                logger.info("已执行 Game Bar 小组件的锁定切换命令")
-            return
-
-        logger.warning(f"忽略未知的 Game Bar 控制命令: {command_name}")
+        def execute():
+            # The timer runs on the Qt GUI thread. Call the slot synchronously
+            # so the acknowledgment represents execution, not merely queuing.
+            callback = getattr(self.owner, "process_lock_logic", None)
+            if callback is None or getattr(self.owner, "control_window", None) is None:
+                raise RuntimeError("lock controller is unavailable")
+            callback()
+        self._mailbox.process_commands(execute)

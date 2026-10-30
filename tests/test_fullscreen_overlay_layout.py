@@ -46,6 +46,18 @@ class FullscreenOverlayLayoutTests(unittest.TestCase):
             viewport,
         )
 
+    def test_partial_black_bar_overlap_keeps_whole_panel(self):
+        self.assertEqual(
+            select_capture_geometry((440, 0, 2560, 1440),
+                                    (100, 300, 350, 300), (0, 0, 3440, 1440)),
+            (0, 0, 3440, 1440))
+
+    def test_owner_spanning_monitors_is_not_clipped(self):
+        self.assertEqual(
+            select_capture_geometry((440, 0, 2560, 1440),
+                                    (-100, 300, 350, 300), (0, 0, 3440, 1440)),
+            (-100, 0, 3540, 1440))
+
     def test_edge_touching_is_not_an_intersection(self):
         self.assertFalse(
             rectangles_intersect((0, 0, 100, 100), (100, 0, 100, 100))

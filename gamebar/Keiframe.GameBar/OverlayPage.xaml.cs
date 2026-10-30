@@ -26,6 +26,10 @@ namespace Keiframe.GameBar
         private DateTimeOffset _lastSuccessfulRead = DateTimeOffset.MinValue;
         private DateTimeOffset _lastDiagnosticWrite = DateTimeOffset.MinValue;
         private bool _sizedToFirstFrame;
+        private Task _connectionTask = Task.CompletedTask;
+        private volatile string _session;
+        private volatile string _readySession;
+        private bool _commandPending;
 
         public OverlayPage()
         {
@@ -52,6 +56,7 @@ namespace Keiframe.GameBar
 
         protected override void OnNavigatedFrom(NavigationEventArgs args)
         {
+            StopConnection();
             if (_widget != null)
             {
                 _widget.RequestedOpacityChanged -= RequestedOpacityChanged;
@@ -155,23 +160,81 @@ namespace Keiframe.GameBar
 
         private void PageLoaded(object sender, RoutedEventArgs args)
         {
-            _cancellation = new CancellationTokenSource();
-            _ = Task.Run(() => ConnectionLoop(_cancellation.Token));
+            if (_cancellation != null)
+            {
+                return;
+            }
+            var source = new CancellationTokenSource();
+            _cancellation = source;
+            _session = Guid.NewGuid().ToString("N");
+            var previous = _connectionTask;
+            var session = _session;
+            // A reload waits for the old loop to exit before publishing a new lease.
+            _connectionTask = Task.Run(async () =>
+            {
+                try
+                {
+                    try { await previous; } catch { }
+                    source.Token.ThrowIfCancellationRequested();
+                    _lastMailboxWrite = DateTimeOffset.MinValue;
+                    _lastSuccessfulRead = DateTimeOffset.MinValue;
+                    _lastDiagnosticWrite = DateTimeOffset.MinValue;
+                    _sizedToFirstFrame = false;
+                    await ConnectionLoop(session, source.Token);
+                }
+                catch (OperationCanceledException) { }
+            });
+        }
+
+        private void StopConnection()
+        {
+            var source = _cancellation;
+            _cancellation = null;
+            _session = null;
+            _readySession = null;
+            if (source != null)
+            {
+                source.Cancel();
+                _ = _connectionTask.ContinueWith(_ => source.Dispose());
+            }
+            // Do not delete a shared heartbeat: a new instance may already own it.
+            // The Python bridge stops rendering when this lease expires.
         }
 
         private void PageUnloaded(object sender, RoutedEventArgs args)
         {
-            _cancellation?.Cancel();
-            _cancellation?.Dispose();
-            _cancellation = null;
+            StopConnection();
         }
 
-        private async Task ConnectionLoop(CancellationToken cancellationToken)
+        private async Task ConnectionLoop(
+            string session,
+            CancellationToken cancellationToken)
         {
+            var lastHeartbeat = DateTimeOffset.MinValue;
             while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
+                    // Renew even when no frame exists, otherwise neither side starts.
+                    var heartbeatNow = DateTimeOffset.UtcNow;
+                    if ((heartbeatNow - lastHeartbeat).TotalSeconds >= 1.0)
+                    {
+                        var heartbeat = new JsonObject
+                        {
+                            ["version"] = JsonValue.CreateNumberValue(1),
+                            ["session"] = JsonValue.CreateStringValue(session),
+                            ["updated_at"] = JsonValue.CreateNumberValue(
+                                heartbeatNow.ToUnixTimeMilliseconds() / 1000.0)
+                        };
+                        await WriteAtomicJson(
+                            "overlay.heartbeat", heartbeat, cancellationToken);
+                        if (session == _session)
+                        {
+                            _readySession = session;
+                        }
+                        lastHeartbeat = heartbeatNow;
+                    }
+                    cancellationToken.ThrowIfCancellationRequested();
                     var file = await ApplicationData.Current.LocalFolder.GetFileAsync(
                         FrameFileName);
                     var properties = await file.GetBasicPropertiesAsync();
@@ -218,10 +281,12 @@ namespace Keiframe.GameBar
                             var frameHeight = (int)header.GetNamedNumber(
                                 "height",
                                 180);
+                            cancellationToken.ThrowIfCancellationRequested();
                             await ShowFrame(
                                 imageBytes,
                                 frameWidth,
-                                frameHeight);
+                                frameHeight,
+                                cancellationToken);
                         }
 
                         _lastMailboxWrite = properties.DateModified;
@@ -238,6 +303,7 @@ namespace Keiframe.GameBar
                 {
                     try
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var now = DateTimeOffset.UtcNow;
                         if ((now - _lastDiagnosticWrite).TotalSeconds >= 2.0)
                         {
@@ -278,7 +344,8 @@ namespace Keiframe.GameBar
         private async Task ShowFrame(
             byte[] pngBytes,
             int frameWidth,
-            int frameHeight)
+            int frameHeight,
+            CancellationToken cancellationToken)
         {
             var completion = new TaskCompletionSource<bool>();
             await Dispatcher.RunAsync(
@@ -287,6 +354,7 @@ namespace Keiframe.GameBar
                 {
                     try
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         using (var stream = new InMemoryRandomAccessStream())
                         {
                             using (var writer = new DataWriter(stream))
@@ -300,6 +368,7 @@ namespace Keiframe.GameBar
                             stream.Seek(0);
                             var bitmap = new BitmapImage();
                             await bitmap.SetSourceAsync(stream);
+                            cancellationToken.ThrowIfCancellationRequested();
                             OverlayImage.Source = bitmap;
                             StatusPanel.Visibility = Visibility.Collapsed;
                         }
@@ -330,23 +399,116 @@ namespace Keiframe.GameBar
             await completion.Task;
         }
 
+        private static async Task WriteAtomicJson(
+            string name,
+            JsonObject value,
+            CancellationToken cancellationToken)
+        {
+            StorageFile temporary = null;
+            try
+            {
+                temporary = await ApplicationData.Current.LocalFolder.CreateFileAsync(
+                    name + "." + Guid.NewGuid().ToString("N") + ".tmp",
+                    CreationCollisionOption.FailIfExists);
+                await FileIO.WriteTextAsync(temporary, value.Stringify());
+                cancellationToken.ThrowIfCancellationRequested();
+                await temporary.RenameAsync(name, NameCollisionOption.ReplaceExisting);
+                temporary = null;
+            }
+            finally
+            {
+                if (temporary != null)
+                {
+                    try { await temporary.DeleteAsync(); } catch { }
+                }
+            }
+        }
+
+        private static async Task DeleteMailboxFile(string name)
+        {
+            try
+            {
+                var file = await ApplicationData.Current.LocalFolder.GetFileAsync(name);
+                await file.DeleteAsync();
+            }
+            catch
+            {
+                // Best-effort cleanup must not fault the async UI event handler.
+            }
+        }
+
         private async void ToggleLockClicked(
             object sender,
             RoutedEventArgs args)
         {
+            if (_commandPending || _cancellation == null || _session == null)
+            {
+                return;
+            }
+            if (_readySession != _session)
+            {
+                InteractionHint.Text = "连接尚未就绪，请稍候再试";
+                return;
+            }
+            _commandPending = true;
+            var cancellationToken = _cancellation.Token;
+            var session = _session;
+            var id = Guid.NewGuid().ToString("N");
+            var commandName = "overlay.command." + id + ".json";
+            var ackName = "overlay.ack." + id + ".json";
             try
             {
-                var file = await ApplicationData.Current.LocalFolder.CreateFileAsync(
-                    "overlay.command",
-                    CreationCollisionOption.ReplaceExisting);
-                await FileIO.WriteTextAsync(
-                    file,
-                    $"toggle_lock\r\n{DateTimeOffset.UtcNow:O}\r\n");
-                InteractionHint.Text = "已切换 Keiframe 锁定状态";
+                var command = new JsonObject
+                {
+                    ["version"] = JsonValue.CreateNumberValue(1),
+                    ["id"] = JsonValue.CreateStringValue(id),
+                    ["session"] = JsonValue.CreateStringValue(session),
+                    ["action"] = JsonValue.CreateStringValue("toggle_lock"),
+                    ["created_at"] = JsonValue.CreateNumberValue(
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0)
+                };
+                InteractionHint.Text = "正在等待 Keiframe 确认…";
+                await WriteAtomicJson(commandName, command, cancellationToken);
+                var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+                while (DateTimeOffset.UtcNow < deadline)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    try
+                    {
+                        var file = await ApplicationData.Current.LocalFolder.GetFileAsync(
+                            ackName);
+                        var ack = JsonObject.Parse(await FileIO.ReadTextAsync(file));
+                        cancellationToken.ThrowIfCancellationRequested();
+                        if (ack.GetNamedString("id", "") == id)
+                        {
+                            InteractionHint.Text = ack.GetNamedBoolean("ok", false)
+                                ? "已切换 Keiframe 锁定状态"
+                                : "切换失败：" + ack.GetNamedString("error", "命令被拒绝");
+                            return;
+                        }
+                    }
+                    catch (FileNotFoundException) { }
+                    await Task.Delay(100, cancellationToken);
+                }
+                // Never resend a toggle: it may have executed before the reply was lost.
+                InteractionHint.Text = "未收到执行确认；状态未知，请检查主窗口，勿重复点击";
+            }
+            catch (OperationCanceledException)
+            {
+                // The page closed. Do not claim success or update a different session.
             }
             catch (Exception error)
             {
-                InteractionHint.Text = $"切换失败：{error.Message}";
+                if (session == _session)
+                {
+                    InteractionHint.Text = $"操作未确认：{error.Message}";
+                }
+            }
+            finally
+            {
+                await DeleteMailboxFile(commandName);
+                await DeleteMailboxFile(ackName);
+                _commandPending = false;
             }
         }
 
@@ -354,6 +516,7 @@ namespace Keiframe.GameBar
             object sender,
             RoutedEventArgs args)
         {
+            StopConnection();
             _widget?.Close();
         }
 

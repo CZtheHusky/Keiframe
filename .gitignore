@@ -20,13 +20,6 @@ ENV/
 .idea/
 .vscode/
 
-# Xbox Game Bar / UWP build output
-gamebar/**/bin/
-gamebar/**/obj/
-gamebar/**/AppPackages/
-gamebar/artifacts/
-gamebar/**/Assets/main_menu.png
-
 # Logs
 log/
 *.log
@@ -41,6 +34,7 @@ ext-exe/bin/
 src/monkey.js
 /src/map_handlers/debugpath/
 *.xlsx
+
 /python/Lib
 /python/Scripts
 /废案
@@ -51,10 +45,19 @@ src/monkey.js
 /Keiframe_Release_v1.02
 /.venv
 settings.json
-/启动Keiframe.bat
 
 #project embeddable required
 !/python/*.pyd
 !/python/*.dll
 /python/share
 /.vs
+/debug
+
+
+# Xbox Game Bar / UWP build output
+gamebar/**/bin/
+gamebar/**/obj/
+gamebar/**/AppPackages/
+gamebar/artifacts/
+gamebar/**/Assets/main_menu.png
+/启动Keiframe.bat
